@@ -9,6 +9,8 @@ const (
 
 	TypeLimit  = "limit"
 	TypeMarket = "market"
+	TypeIOC    = "ioc" // immediate-or-cancel: trade what is available, cancel the rest
+	TypeFOK    = "fok" // fill-or-kill: trade the whole quantity at once or nothing
 
 	StatusPending   = "pending"
 	StatusOpen      = "open"
@@ -154,13 +156,19 @@ func orderView(order *Order, symbol *Symbol, reason string) OrderView {
 		UpdatedAt:     order.UpdatedAt,
 		LastUpdatedBy: reason,
 	}
-	if order.Type == TypeLimit {
+	if pricedOrder(order.Type) {
 		price := ScalePrice(order.LimitPrice, symbol.PriceScale)
 		ticks := order.LimitPrice
 		view.LimitPrice = &price
 		view.LimitTicks = &ticks
 	}
 	return view
+}
+
+// pricedOrder reports whether an order type always carries a limit price.
+// limit, ioc and fok are priced; market is not.
+func pricedOrder(orderType string) bool {
+	return orderType == TypeLimit || orderType == TypeIOC || orderType == TypeFOK
 }
 
 // tradeView projects a trade for the API.

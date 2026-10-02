@@ -242,8 +242,10 @@ func (a *API) createOrder(request *http.Request) callResult {
 	if side != engine.SideBuy && side != engine.SideSell {
 		return callResult{err: invalidf("side must be buy or sell")}
 	}
-	if orderType != engine.TypeLimit && orderType != engine.TypeMarket {
-		return callResult{err: invalidf("type must be limit or market")}
+	switch orderType {
+	case engine.TypeLimit, engine.TypeMarket, engine.TypeIOC, engine.TypeFOK:
+	default:
+		return callResult{err: invalidf("type must be limit, market, ioc or fok")}
 	}
 	quantity, err := engine.AsInt64(*document.Quantity, "quantity")
 	if err != nil {
@@ -252,8 +254,8 @@ func (a *API) createOrder(request *http.Request) callResult {
 	var limitPrice int64
 	switch {
 	case document.LimitPrice == nil:
-		if orderType == engine.TypeLimit {
-			return callResult{err: invalidf("limit_price is required for a limit order")}
+		if orderType != engine.TypeMarket {
+			return callResult{err: invalidf("limit_price is required for a limit, ioc or fok order")}
 		}
 	case orderType == engine.TypeMarket:
 		return callResult{err: invalidf("limit_price must be omitted for a market order")}
