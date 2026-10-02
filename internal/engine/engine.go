@@ -38,8 +38,8 @@ func (e *Engine) PlaceOrder(explicitID, symbol, side, orderType string, quantity
 	if side != SideBuy && side != SideSell {
 		return OrderView{}, Invalidf("side must be buy or sell")
 	}
-	if orderType != TypeLimit && orderType != TypeMarket {
-		return OrderView{}, Invalidf("type must be limit or market")
+	if orderType != TypeLimit && orderType != TypeMarket && orderType != TypeIOC && orderType != TypeFOK {
+		return OrderView{}, Invalidf("type must be limit, market, ioc, or fok")
 	}
 	if quantity <= 0 {
 		return OrderView{}, Invalidf("quantity must be a positive integer")
@@ -47,15 +47,18 @@ func (e *Engine) PlaceOrder(explicitID, symbol, side, orderType string, quantity
 	if quantity > MaxQuantity {
 		return OrderView{}, Invalidf("quantity must not exceed %d", MaxQuantity)
 	}
-	if orderType == TypeLimit {
+	switch orderType {
+	case TypeMarket:
+		if limitPrice != 0 {
+			return OrderView{}, Invalidf("limit_price must be omitted for a market order")
+		}
+	default:
 		if limitPrice <= 0 {
-			return OrderView{}, Invalidf("limit_price must be a positive integer for a limit order")
+			return OrderView{}, Invalidf("limit_price must be a positive integer for %s orders", orderType)
 		}
 		if limitPrice > MaxQuantity {
 			return OrderView{}, Invalidf("limit_price must not exceed %d ticks", MaxQuantity)
 		}
-	} else if limitPrice != 0 {
-		return OrderView{}, Invalidf("limit_price must be omitted for a market order")
 	}
 	id := explicitID
 	if id == "" {
@@ -74,7 +77,7 @@ func (e *Engine) PlaceOrder(explicitID, symbol, side, orderType string, quantity
 		"type":     orderType,
 		"quantity": quantity,
 	}
-	if orderType == TypeLimit {
+	if orderType != TypeMarket {
 		data["limit_price"] = limitPrice
 	}
 	if _, err := e.emit(EventOrderAccepted, data); err != nil {
@@ -340,11 +343,19 @@ func (e *Engine) emit(eventType string, data map[string]any) (Event, error) {
 }
 
 // match executes an incoming order against the opposite side of the book using
-// price-time priority. Limit orders that cannot be filled immediately rest;
-// market orders that cannot be filled completely are rejected.
+// price-time priority. Limit orders that cannot be filled completely rest with
+// their remainder; market orders that cannot be filled completely are rejected.
+// An ioc order fills everything the book offers within its limit and is
+// cancelled with the unfilled remainder; a fok order trades only when its whole
+// quantity is available within its limit, otherwise it is rejected without a
+// single trade.
 func (e *Engine) match(taker *Order) {
 	book := e.state.Books[taker.Symbol]
 	if book == nil {
+		return
+	}
+	if taker.Type == TypeFOK && !fokFillable(book, taker) {
+		e.rejectOrder(taker, "insufficient_liquidity")
 		return
 	}
 	for taker.Remaining > 0 {
@@ -356,7 +367,7 @@ func (e *Engine) match(taker *Order) {
 			break
 		}
 		level := (*levels)[0]
-		if taker.Type == TypeLimit {
+		if taker.Type != TypeMarket {
 			if taker.Side == SideBuy && level.Price > taker.LimitPrice {
 				break
 			}
@@ -378,26 +389,70 @@ func (e *Engine) match(taker *Order) {
 			return
 		}
 	}
-	if taker.Remaining == 0 {
+	switch {
+	case taker.Remaining == 0:
 		return
-	}
-	if taker.Type == TypeLimit {
+	case taker.Type == TypeLimit:
 		// Drop any stale level entry first: an order that partially traded has
 		// already been touched by Apply and must rest exactly once.
 		book.remove(taker)
 		book.add(taker)
 		return
+	case taker.Type == TypeIOC:
+		// An ioc order never rests: its unfilled remainder is cancelled, while
+		// whatever already traded stays traded and visible on the tape.
+		e.cancelRemainder(taker)
+	default:
+		// A market order never rests: any unexecuted remainder is rejected.
+		e.rejectOrder(taker, "insufficient_liquidity")
 	}
-	// A market order never rests: any unexecuted remainder is rejected outright.
-	if _, err := e.emit(EventOrderRejected, map[string]any{
-		"order_id":           taker.ID,
-		"reason":             "insufficient_liquidity",
-		"unfilled_quantity":  taker.Remaining,
-		"filled_quantity":    taker.Filled,
-		"requested_quantity": taker.Quantity,
-	}); err != nil {
-		return
+}
+
+// fokFillable reports whether the opposite side can absorb the whole taker
+// quantity at prices within its limit, walking the levels in price-time order.
+// It mutates nothing, so a negative answer costs not a single trade.
+func fokFillable(book *Book, taker *Order) bool {
+	levels := book.Asks
+	if taker.Side == SideSell {
+		levels = book.Bids
 	}
+	available := int64(0)
+	for _, level := range levels {
+		if taker.Side == SideBuy && level.Price > taker.LimitPrice {
+			break
+		}
+		if taker.Side == SideSell && level.Price < taker.LimitPrice {
+			break
+		}
+		for _, maker := range level.Orders {
+			available += maker.Remaining
+			if available >= taker.Remaining {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rejectOrder terminates an order as rejected, keeping the quantities it held
+// at the end of matching.
+func (e *Engine) rejectOrder(order *Order, reason string) {
+	_, _ = e.emit(EventOrderRejected, map[string]any{
+		"order_id":           order.ID,
+		"reason":             reason,
+		"unfilled_quantity":  order.Remaining,
+		"filled_quantity":    order.Filled,
+		"requested_quantity": order.Quantity,
+	})
+}
+
+// cancelRemainder terminates an ioc order as cancelled with its unfilled
+// remainder left in place.
+func (e *Engine) cancelRemainder(order *Order) {
+	_, _ = e.emit(EventOrderCancelled, map[string]any{
+		"order_id":        order.ID,
+		"filled_quantity": order.Filled,
+	})
 }
 
 // execute records one fill between a resting maker and an incoming taker.

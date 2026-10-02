@@ -1,20 +1,26 @@
 # Matchbook
 
-Matchbook is a small backend for a limit order book. It accepts limit and market
-orders, matches them by price-time priority, reports trades, serves book
-snapshots, and records every command in an append-only event log so the whole
-market can be rebuilt and checked against the live state.
+Matchbook is a small backend for a limit order book. It accepts limit, market,
+ioc, and fok orders, matches them by price-time priority, reports trades,
+serves book snapshots, and records every command in an append-only event log so
+the whole market can be rebuilt and checked against the live state.
 
 The initial release intentionally supports a compact public contract:
 
-- orders are either `limit` or `market`, and every price and quantity is an
-  integer in ticks, so no floating point value ever reaches the matching engine;
+- orders are `limit`, `market`, `ioc`, or `fok`, and every price and quantity
+  is an integer in ticks, so no floating point value ever reaches the matching
+  engine;
 - a trade always executes at the resting (maker) side's price;
 - price-time priority: the best price wins, and orders at the same price are
   filled oldest first;
 - an incoming limit order fills as much as the book allows and rests with its
   remainder; a market order never rests and is rejected when the book cannot
   fill it completely;
+- an `ioc` (immediate-or-cancel) order fills as much as the book offers within
+  its limit and is `cancelled` with whatever remains, so it never rests;
+- a `fok` (fill-or-kill) order trades only when its whole quantity is available
+  within its limit in one pass; otherwise it is `rejected` without a single
+  trade;
 - the best bid is always strictly below the best ask, because any executable
   pair would have been consumed on arrival;
 - every order keeps `quantity == filled + remaining` at all observable times;
@@ -64,8 +70,8 @@ and repeated arithmetic on it is exact.
 | `id` | string | unique, at most 100 characters, supplied by the client or generated as `ord-<n>` |
 | `symbol` | string | must be registered |
 | `side` | `buy` \| `sell` | |
-| `type` | `limit` \| `market` | |
-| `limit_price` | integer ticks | required for `limit`, must be omitted for `market` |
+| `type` | `limit` \| `market` \| `ioc` \| `fok` | |
+| `limit_price` | integer ticks | required for `limit`, `ioc`, and `fok`; must be omitted for `market` |
 | `quantity` | integer | `1 .. 1000000000` |
 
 An order is created with status `pending`; the recorded events immediately move
@@ -77,14 +83,21 @@ it to `open`, `filled`, `cancelled`, or `rejected`.
 pending --(order_accepted)--> open
 open --(order_updated, remaining > 0)--> open
 open --(order_filled, remaining == 0)--> filled      [terminal]
-open --(order_cancelled)--> cancelled                [terminal]
-pending --(order_rejected, no liquidity)--> rejected [terminal, market only]
+open --(order_cancelled)--> cancelled                [terminal, limit cancel or ioc remainder]
+open --(order_rejected, no liquidity)--> rejected    [terminal, market remainder or unfillable fok]
 ```
 
 A partially filled order that is later cancelled becomes `cancelled` with
 `filled_quantity > 0`; a partially filled order that fills its remainder becomes
-`filled`. `filled`, `cancelled`, and `rejected` are terminal: cancelling them is
-a `conflict`, and they never rest in the book again.
+`filled`. This is how an `ioc` order ends: it records one `order_updated` per
+fill and then `order_cancelled` for its remainder, so a partially filled `ioc`
+is `cancelled` while a fully filled one is `filled`. A `fok` order is checked
+before any fill: when the book cannot absorb its whole quantity within its
+limit it records `order_rejected` with `filled_quantity: 0`,
+`remaining_quantity` equal to `quantity`, and no trades; otherwise it fills
+completely and becomes `filled`. `filled`, `cancelled`, and `rejected` are
+terminal: cancelling them is a `conflict`, and they never rest in the book
+again.
 
 ### Trade
 
@@ -204,8 +217,8 @@ resulting state, for example a taker that consumes two price levels:
 
 Matching rules:
 
-- a `buy` limit order matches asks priced at or below its limit; a `sell` limit
-  order matches bids priced at or above its limit;
+- a `buy` order with a limit matches asks priced at or below its limit; a
+  `sell` order with a limit matches bids priced at or above its limit;
 - the best price level trades first, and inside a level the oldest order trades
   first;
 - each fill is capped by the remaining quantity of both orders;
@@ -214,7 +227,65 @@ Matching rules:
 - a `market` order matches every level it can reach and never rests. If any
   quantity is left over, the whole order ends as `rejected` with
   `remaining_quantity > 0` and `status: "rejected"`; the quantity that already
-  traded stays traded and remains visible through `/trades`.
+  traded stays traded and remains visible through `/trades`;
+- an `ioc` order walks the book exactly like a limit order but never rests. It
+  trades every level within its limit (at the maker price of each level) and
+  ends `filled` when nothing remains, otherwise `cancelled` with
+  `filled_quantity` and `remaining_quantity` reporting exactly what did and did
+  not trade;
+- a `fok` order is atomic. Before trading, the engine sums the quantity
+  available across every level within its limit in price-time order; if that
+  total is below its quantity it ends `rejected` with `filled_quantity: 0`,
+  `remaining_quantity` equal to its original `quantity`, and no trades. When the
+  total is sufficient it fills in one pass — best price first, oldest order at a
+  level first — and ends `filled`.
+
+A partially filled `ioc` order's response:
+
+```json
+{
+  "id": "ioc-1",
+  "symbol": "ACME",
+  "side": "buy",
+  "type": "ioc",
+  "status": "cancelled",
+  "price_scale": 0,
+  "limit_price": "103",
+  "limit_price_ticks": 103,
+  "quantity": 12,
+  "filled_quantity": 10,
+  "remaining_quantity": 2,
+  "trade_ids": ["trade-1", "trade-2"],
+  "sequence": 9,
+  "created_at": 1700000000000,
+  "updated_at": 1700000000000,
+  "last_updated_by": "created"
+}
+```
+
+A `fok` order that the book cannot absorb is rejected without touching the
+book:
+
+```json
+{
+  "id": "fok-1",
+  "symbol": "ACME",
+  "side": "buy",
+  "type": "fok",
+  "status": "rejected",
+  "price_scale": 0,
+  "limit_price": "103",
+  "limit_price_ticks": 103,
+  "quantity": 11,
+  "filled_quantity": 0,
+  "remaining_quantity": 11,
+  "trade_ids": [],
+  "sequence": 11,
+  "created_at": 1700000000000,
+  "updated_at": 1700000000000,
+  "last_updated_by": "created"
+}
+```
 
 A rejected market order's response:
 
@@ -374,12 +445,12 @@ The event log is JSON Lines, one object per line, inside `--data`:
 | Type | Payload | Meaning |
 | --- | --- | --- |
 | `symbol_added` | `symbol`, `price_scale` | a symbol was registered |
-| `order_accepted` | `order_id`, `symbol`, `side`, `type`, `quantity`, `limit_price` (limit only) | an order entered the engine |
+| `order_accepted` | `order_id`, `symbol`, `side`, `type`, `quantity`, `limit_price` (limit, ioc and fok only; omitted for market) | an order entered the engine |
 | `trade_executed` | `trade_id`, `maker_order_id`, `taker_order_id`, `price`, `quantity` | one fill |
 | `order_updated` | `order_id`, `filled_quantity`, `remaining_quantity`, `trade_id` | an order partially filled |
 | `order_filled` | `order_id`, `filled_quantity`, `trade_id` | an order reached `filled` |
-| `order_cancelled` | `order_id`, `filled_quantity` | an order was cancelled |
-| `order_rejected` | `order_id`, `reason`, `requested_quantity`, `filled_quantity`, `unfilled_quantity` | a market order could not be filled |
+| `order_cancelled` | `order_id`, `filled_quantity` | an order was cancelled outright, or an `ioc` remainder was cancelled |
+| `order_rejected` | `order_id`, `reason`, `requested_quantity`, `filled_quantity`, `unfilled_quantity` | a market order had an unfilled remainder, or a `fok` order could not be filled in one pass (zero trades) |
 
 The live engine applies every event through the same code path that replay uses
 and never mutates an order directly, so `events.jsonl` is the single source of
@@ -410,5 +481,7 @@ go test ./...
 ```
 
 The suite covers price-time priority, partial fills, market sweeps and rejects,
-cancellation, quantity conservation, the no-cross invariant, event-log replay,
-reload from disk, and every HTTP status and error code above.
+ioc sweeps, cancellations and zero-fill cancellations, atomic fok fills and
+zero-trade rejections, the fok limit boundary, quantity conservation, the
+no-cross invariant, event-log replay, reload from disk, and every HTTP status
+and error code above.

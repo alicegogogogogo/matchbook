@@ -9,6 +9,8 @@ const (
 
 	TypeLimit  = "limit"
 	TypeMarket = "market"
+	TypeIOC    = "ioc"
+	TypeFOK    = "fok"
 
 	StatusPending   = "pending"
 	StatusOpen      = "open"
@@ -154,7 +156,7 @@ func orderView(order *Order, symbol *Symbol, reason string) OrderView {
 		UpdatedAt:     order.UpdatedAt,
 		LastUpdatedBy: reason,
 	}
-	if order.Type == TypeLimit {
+	if order.Type == TypeLimit || order.Type == TypeIOC || order.Type == TypeFOK {
 		price := ScalePrice(order.LimitPrice, symbol.PriceScale)
 		ticks := order.LimitPrice
 		view.LimitPrice = &price
