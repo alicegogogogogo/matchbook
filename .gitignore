@@ -1,0 +1,14 @@
+# Build output
+/matchbook
+/bin/
+*.exe
+
+# Runtime state
+*.log
+data/
+tmp/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
